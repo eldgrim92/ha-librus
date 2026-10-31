@@ -1,11 +1,11 @@
 {
   "domain": "librus",
   "name": "Librus Synergia",
-  "codeowners": ["@patrykstras"],
+  "codeowners": ["@eldgrim92"],
   "config_flow": true,
-  "documentation": "https://github.com/patrykstras/ha-librus",
+  "documentation": "https://github.com/eldgrim92/ha-librus",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/patrykstras/ha-librus/issues",
+  "issue_tracker": "https://github.com/eldgrim92/ha-librus/issues",
   "requirements": [
     "beautifulsoup4>=4.12.0"
   ],

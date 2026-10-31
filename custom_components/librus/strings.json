@@ -1,0 +1,44 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add Child's Librus Synergia Account",
+        "description": "Enter the Librus Synergia login credentials for your child. To add multiple children, add the integration once per child account.",
+        "data": {
+          "username": "Librus Username (e.g. 1234567u or parent login)",
+          "password": "Password",
+          "student_name": "Child's Display Name (optional, auto-detected if empty)",
+          "sync_interval": "Synchronization Period (minutes, 5-360)",
+          "max_items": "Number of recent messages/grades/notes to store (3-50)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Librus Synergia servers. Please try again later.",
+      "invalid_auth": "Invalid Librus username or password.",
+      "unknown": "Unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This child's Librus account is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Librus Synergia Options",
+        "description": "Configure the synchronization interval, history size, or update the account password.",
+        "data": {
+          "sync_interval": "Synchronization Period (minutes, 5-360)",
+          "max_items": "Number of recent messages/grades/notes to store (3-50)",
+          "password": "New Password (leave empty to keep current)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Librus Synergia servers.",
+      "invalid_auth": "The provided new password was rejected by Librus.",
+      "unknown": "Unexpected error occurred."
+    }
+  }
+}
+

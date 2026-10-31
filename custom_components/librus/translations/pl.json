@@ -1,0 +1,44 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Dodaj konto dziecka Librus Synergia",
+        "description": "Podaj dane logowania do konta Librus Synergia dla dziecka. Aby dodać kilkoro dzieci, dodaj integrację osobno dla każdego konta.",
+        "data": {
+          "username": "Login Librus (np. 1234567u lub konto rodzica)",
+          "password": "Hasło",
+          "student_name": "Imię dziecka / Nazwa wyświetlana (opcjonalnie, wykrywana automatycznie)",
+          "sync_interval": "Okres synchronizacji (w minutach, 5-360)",
+          "max_items": "Liczba ostatnich wiadomości/ocen/uwag na liście (3-50)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Nie udało się połączyć z serwerem Librus Synergia. Spróbuj ponownie później.",
+      "invalid_auth": "Nieprawidłowy login lub hasło Librus.",
+      "unknown": "Wystąpił nieoczekiwany błąd."
+    },
+    "abort": {
+      "already_configured": "To konto Librus jest już skonfigurowane."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opcje Librus Synergia",
+        "description": "Zmień częstotliwość synchronizacji, liczbę pamiętanych wpisów lub zaktualizuj hasło.",
+        "data": {
+          "sync_interval": "Okres synchronizacji (w minutach, 5-360)",
+          "max_items": "Liczba ostatnich wiadomości/ocen/uwag na liście (3-50)",
+          "password": "Nowe hasło (pozostaw puste, aby nie zmieniać)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Nie udało się połączyć z serwerem Librus Synergia.",
+      "invalid_auth": "Podane nowe hasło zostało odrzucone przez Librus.",
+      "unknown": "Wystąpił nieoczekiwany błąd."
+    }
+  }
+}
+

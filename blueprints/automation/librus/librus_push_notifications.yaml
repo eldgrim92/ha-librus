@@ -1,0 +1,123 @@
+blueprint:
+  name: "Librus Synergia — Powiadomienia Push (Wiadomości, Oceny, Uwagi)"
+  description: >
+    Wysyła czytelne powiadomienia push na wybrane urządzenie z aplikacją Home Assistant Companion
+    za każdym razem, gdy na koncie dziecka w Librus Synergia pojawi się nowa wiadomość, nowa ocena
+    lub nowa uwaga/pochwała. Obsługuje jedno lub wiele dzieci.
+  domain: automation
+  input:
+    notify_device:
+      name: Urządzenie docelowe (telefon / tablet)
+      description: Wybierz urządzenie z zainstalowaną aplikacją Home Assistant Companion.
+      selector:
+        device:
+          integration: mobile_app
+    student_filter:
+      name: Filtr imienia dziecka (opcjonalnie)
+      description: >
+        Pozostaw puste, aby otrzymywać powiadomienia dla wszystkich skonfigurowanych dzieci,
+        lub wpisz nazwę/imię dziecka (np. "Jan Kowalski"), aby filtrować tylko jedno konto.
+      default: ""
+      selector:
+        text:
+    notify_on_message:
+      name: Powiadamiaj o nowych wiadomościach
+      default: true
+      selector:
+        boolean:
+    notify_on_grade:
+      name: Powiadamiaj o nowych ocenach
+      default: true
+      selector:
+        boolean:
+    notify_on_note:
+      name: Powiadamiaj o nowych uwagach i pochwałach
+      default: true
+      selector:
+        boolean:
+
+mode: queued
+max: 20
+
+variables:
+  student_filter_val: !input student_filter
+  notify_msg: !input notify_on_message
+  notify_grd: !input notify_on_grade
+  notify_nte: !input notify_on_note
+
+triggers:
+  - trigger: event
+    event_type: librus_new_message
+    id: new_message
+  - trigger: event
+    event_type: librus_new_grade
+    id: new_grade
+  - trigger: event
+    event_type: librus_new_note
+    id: new_note
+
+conditions:
+  - condition: template
+    value_template: >
+      {{ student_filter_val == '' or (trigger.event.data.student_name | default('') | lower) == (student_filter_val | lower) }}
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: new_message
+          - condition: template
+            value_template: "{{ notify_msg }}"
+        sequence:
+          - domain: mobile_app
+            type: notify
+            device_id: !input notify_device
+            title: "📩 Librus ({{ trigger.event.data.student_name }}): {{ trigger.event.data.subject }}"
+            message: >
+              Od: {{ trigger.event.data.sender }}
+              {% if trigger.event.data.has_attachments %}📎 Zawiera załącznik{% endif %}
+
+              {{ (trigger.event.data.body_text | default(''))[:400] }}
+            data:
+              group: "librus_messages_{{ trigger.event.data.student_name }}"
+              tag: "librus_msg_{{ trigger.event.data.message_id }}"
+              importance: high
+
+      - conditions:
+          - condition: trigger
+            id: new_grade
+          - condition: template
+            value_template: "{{ notify_grd }}"
+        sequence:
+          - domain: mobile_app
+            type: notify
+            device_id: !input notify_device
+            title: "🎓 Nowa ocena ({{ trigger.event.data.student_name }}): {{ trigger.event.data.grade }} — {{ trigger.event.data.subject }}"
+            message: >
+              Kategoria: {{ trigger.event.data.category | default('Brak') }} (waga: {{ trigger.event.data.weight | default('-') }})
+              {% if trigger.event.data.teacher %}Nauczyciel: {{ trigger.event.data.teacher }}{% endif %}
+              {% if trigger.event.data.comment %}Komentarz: {{ trigger.event.data.comment }}{% endif %}
+            data:
+              group: "librus_grades_{{ trigger.event.data.student_name }}"
+              tag: "librus_grade_{{ trigger.event.data.grade_id }}"
+              importance: high
+
+      - conditions:
+          - condition: trigger
+            id: new_note
+          - condition: template
+            value_template: "{{ notify_nte }}"
+        sequence:
+          - domain: mobile_app
+            type: notify
+            device_id: !input notify_device
+            title: "📝 {{ trigger.event.data.type | default('Uwaga') }} ({{ trigger.event.data.student_name }})"
+            message: >
+              Nauczyciel: {{ trigger.event.data.teacher | default('Nieznany') }}
+
+              {{ trigger.event.data.content | default('') }}
+            data:
+              group: "librus_notes_{{ trigger.event.data.student_name }}"
+              tag: "librus_note_{{ trigger.event.data.note_id }}"
+              importance: high
+

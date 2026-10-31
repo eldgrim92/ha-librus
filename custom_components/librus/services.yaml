@@ -1,0 +1,12 @@
+refresh:
+  name: Synchronizuj dane Librus
+  description: Wymusza natychmiastową synchronizację kont dzieci w Librus Synergia.
+  fields:
+    entry_id:
+      name: ID konfiguracji (opcjonalnie)
+      description: Jeśli podane, odświeża tylko wskazane konto dziecka. Jeśli puste, odświeża wszystkie skonfigurowane konta.
+      required: false
+      example: "01HXYZ..."
+      selector:
+        text:
+

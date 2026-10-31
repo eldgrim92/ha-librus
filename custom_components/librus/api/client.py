@@ -1,9 +1,22 @@
-"""Async Librus Synergia & Wiadomości API client."""
+"""Async Librus Synergia & Wiadomości API client.
+
+Implements the authorization and session flow from `Mati365/librus-api`:
+1. GET `https://api.librus.pl/OAuth/Authorization?client_id=46&response_type=code&scope=mydata`
+   (or via `https://synergia.librus.pl/loguj/portalRodzina`) to initialize `oauth_state` cookies.
+2. POST credentials (`action=login`, `login=...`, `pass=...`) to
+   `https://api.librus.pl/OAuth/Authorization?client_id=46`.
+3. Follow `goTo` / `https://api.librus.pl/OAuth/Authorization/Grant?client_id=46` (and `/2FA?client_id=46`)
+   which redirects to `synergia.librus.pl` and establishes `DZIENNIKSID` / `SDZIENNIKSID` cookies.
+4. Activate the API Gateway session via `Auth/TokenInfo` and `Auth/UserInfo {identifier}` if needed,
+   and support both the JSON gateway (`gateway/api/2.0/...`) and HTML scraping (`Mati365/librus-api`
+   endpoints: `/informacje`, `/przegladaj_oceny/uczen`, `/uwagi`, `/wiadomosci`).
+"""
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import hashlib
 import logging
 import re
 from typing import Any
@@ -16,10 +29,17 @@ except ImportError:  # pragma: no cover - fallback for test environments without
 from ..const import (
     DEFAULT_MAX_ITEMS,
     LIBRUS_API_BASE_URL,
+    LIBRUS_API_TOKEN_INFO_URL,
+    LIBRUS_API_USER_INFO_URL,
     LIBRUS_OAUTH_2FA_URL,
     LIBRUS_OAUTH_AUTH_URL,
+    LIBRUS_OAUTH_GRANT_URL,
     LIBRUS_OAUTH_LOGIN_URL,
+    LIBRUS_SYNERGIA_GRADES_URL,
+    LIBRUS_SYNERGIA_INFO_URL,
     LIBRUS_SYNERGIA_MESSAGES_URL,
+    LIBRUS_SYNERGIA_NOTES_URL,
+    LIBRUS_SYNERGIA_URL,
 )
 from .models import (
     LibrusDataSnapshot,
@@ -41,13 +61,17 @@ _LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_HEADERS: dict[str, str] = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept": "application/json, text/javascript, text/html, */*; q=0.01",
     "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
 _MESSAGE_ID_RE = re.compile(r"/wiadomosci/\d+/\d+/(\d+)")
+_GRADE_ID_RE = re.compile(r"/pokaz_lekcje/(\d+)|ocena[_-]?(\d+)")
+_KV_TITLE_RE = re.compile(r"([^:\n]+):\s*([^\n<]+)")
+
 _NETWORK_EXCEPTIONS: tuple[type[BaseException], ...] = (
     (aiohttp.ClientError, asyncio.TimeoutError, OSError)
     if aiohttp is not None
@@ -68,7 +92,7 @@ class LibrusConnectionError(LibrusApiError):
 
 
 class LibrusApiClient:
-    """Async client for Librus Synergia REST API and Wiadomości portal."""
+    """Async client for Librus Synergia using the `Mati365/librus-api` authorization approach."""
 
     def __init__(
         self,
@@ -84,10 +108,11 @@ class LibrusApiClient:
         self._internal_session: Any = None
         self._cookie_jar = aiohttp.CookieJar(unsafe=True) if aiohttp else None
         self._authenticated = False
+        self._gateway_available = True
         self._max_items = max_items
         self._lock = asyncio.Lock()
 
-        # Caches for lookup tables (subjects, categories, users/teachers)
+        # Caches for JSON gateway lookup tables (subjects, categories, users/teachers)
         self._subjects_cache: dict[int, str] = {}
         self._grade_categories_cache: dict[int, tuple[str, int | float | None]] = {}
         self._note_categories_cache: dict[int, tuple[str, bool | None]] = {}
@@ -125,49 +150,106 @@ class LibrusApiClient:
             self._internal_session = None
 
     async def async_authenticate(self) -> None:
-        """Authenticate with Librus OAuth and establish a Synergia session."""
+        """Authorize with Librus Synergia using the `Mati365/librus-api` `authorize()` workflow.
+
+        Steps:
+        1. `GET https://api.librus.pl/OAuth/Authorization?client_id=46&response_type=code&scope=mydata`
+           to initialize the OAuth session and cookies (`oauth_state`).
+        2. `POST https://api.librus.pl/OAuth/Authorization?client_id=46` with form data:
+           `action=login`, `login=<username>`, `pass=<password>`.
+        3. Follow the grant step:
+           - If the login response provides a `goTo` path (e.g. `/OAuth/Authorization/Grant?client_id=46`
+             or `/OAuth/Authorization/2FA?client_id=46`), follow `https://api.librus.pl{goTo}`.
+           - Also ensure `https://api.librus.pl/OAuth/Authorization/Grant?client_id=46` is completed
+             so the redirect to `synergia.librus.pl` sets `DZIENNIKSID` / `SDZIENNIKSID` cookies.
+        4. Activate the Synergia API Gateway session (`Auth/TokenInfo` -> `Auth/UserInfo/{identifier}`)
+           when available.
+        """
         session = await self._get_session()
         if self._cookie_jar is not None:
             self._cookie_jar.clear()
 
         try:
-            # Step 1: Initialize OAuth authorization cookie
-            async with session.get(LIBRUS_OAUTH_AUTH_URL) as resp:
+            # Step 1: Initialize OAuth authorization cookie (exact URL from Mati365/librus-api)
+            async with session.get(
+                LIBRUS_OAUTH_AUTH_URL,
+                allow_redirects=True,
+            ) as resp:
                 if resp.status >= 500:
                     raise LibrusConnectionError(
-                        f"Librus OAuth server error: HTTP {resp.status}"
+                        f"Librus OAuth server error during initialization: HTTP {resp.status}"
                     )
 
-            # Step 2: Submit login & password
-            payload = {
+            # Step 2: Submit credentials via form-urlencoded POST
+            form_payload = {
                 "action": "login",
                 "login": self._username,
                 "pass": self._password,
             }
-            async with session.post(LIBRUS_OAUTH_LOGIN_URL, data=payload) as resp:
+            login_headers = {
+                "Referer": LIBRUS_OAUTH_AUTH_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            async with session.post(
+                LIBRUS_OAUTH_LOGIN_URL,
+                data=form_payload,
+                headers=login_headers,
+            ) as resp:
                 if resp.status in (401, 403):
                     raise LibrusAuthError("Invalid Librus username or password")
 
                 data = await self._safe_json(resp)
-                status = (data or {}).get("status")
-                if status == "error" or "errors" in (data or {}):
-                    raise LibrusAuthError("Invalid Librus username or password")
+                if isinstance(data, dict):
+                    status = data.get("status")
+                    if status == "error" or data.get("errors"):
+                        raise LibrusAuthError("Invalid Librus username or password")
+                    go_to = data.get("goTo")
+                else:
+                    go_to = None
 
-                go_to = (data or {}).get("goTo")
+            # Step 3: Complete Grant / 2FA redirect as in Mati365/librus-api
+            # Mati365/librus-api calls `GET https://api.librus.pl/OAuth/Authorization/Grant?client_id=46`
+            # (or follows `goTo` from the JSON response) to exchange the OAuth code and set Synergia cookies.
+            grant_targets: list[str] = []
+            if go_to:
+                resolved_goto = (
+                    f"https://api.librus.pl{go_to}"
+                    if go_to.startswith("/")
+                    else go_to
+                )
+                grant_targets.append(resolved_goto)
 
-            # Step 3: Follow 2FA / Grant redirect to obtain Synergia session cookies
-            target_url = (
-                f"https://api.librus.pl{go_to}"
-                if go_to and go_to.startswith("/")
-                else (go_to or LIBRUS_OAUTH_2FA_URL)
-            )
-            async with session.get(target_url, allow_redirects=True) as resp:
-                if resp.status in (401, 403):
-                    raise LibrusAuthError("Failed to finalize Librus OAuth session")
-                if resp.status >= 500:
-                    raise LibrusConnectionError(
-                        f"Librus session initialization failed: HTTP {resp.status}"
-                    )
+            if LIBRUS_OAUTH_GRANT_URL not in grant_targets:
+                grant_targets.append(LIBRUS_OAUTH_GRANT_URL)
+
+            grant_succeeded = False
+            for target_url in grant_targets:
+                async with session.get(target_url, allow_redirects=True) as grant_resp:
+                    if grant_resp.status in (401, 403):
+                        raise LibrusAuthError("Failed to finalize Librus OAuth Grant")
+                    if grant_resp.status < 400:
+                        grant_succeeded = True
+                        # If we landed on api.librus.pl/OAuth/Authorization/2FA and it returned JSON with goTo
+                        grant_json = await self._safe_json(grant_resp)
+                        if isinstance(grant_json, dict) and grant_json.get("goTo"):
+                            next_goto = str(grant_json["goTo"])
+                            next_url = (
+                                f"https://api.librus.pl{next_goto}"
+                                if next_goto.startswith("/")
+                                else next_goto
+                            )
+                            async with session.get(next_url, allow_redirects=True):
+                                pass
+                        break
+
+            if not grant_succeeded:
+                # Fallback to 2FA endpoint if Grant endpoint wasn't reachable directly
+                async with session.get(LIBRUS_OAUTH_2FA_URL, allow_redirects=True) as resp_2fa:
+                    if resp_2fa.status >= 400:
+                        raise LibrusAuthError("Failed to establish Librus Synergia session")
+
+            # Step 4: Activate API Gateway token if supported (Auth/TokenInfo -> Auth/UserInfo)
+            await self._async_activate_api_gateway(session)
 
             self._authenticated = True
         except LibrusApiError:
@@ -176,6 +258,20 @@ class LibrusApiClient:
             raise LibrusConnectionError(
                 f"Network error connecting to Librus: {err}"
             ) from err
+
+    async def _async_activate_api_gateway(self, session: Any) -> None:
+        """Activate `synergia.librus.pl/gateway/api/2.0` session if available."""
+        try:
+            async with session.get(LIBRUS_API_TOKEN_INFO_URL) as token_resp:
+                if token_resp.status != 200:
+                    return
+                token_data = await self._safe_json(token_resp)
+                identifier = (token_data or {}).get("UserIdentifier")
+                if identifier:
+                    async with session.get(f"{LIBRUS_API_USER_INFO_URL}/{identifier}"):
+                        pass
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Optional gateway TokenInfo activation skipped")
 
     async def _api_get(self, endpoint: str, retry_auth: bool = True) -> dict[str, Any]:
         """Perform an authenticated GET request to Librus Synergia JSON API."""
@@ -188,7 +284,10 @@ class LibrusApiClient:
         try:
             async with session.get(url) as resp:
                 if resp.status in (401, 403) and retry_auth:
-                    _LOGGER.debug("Librus session expired, re-authenticating for %s", self._username)
+                    _LOGGER.debug(
+                        "Librus session expired, re-authenticating for %s",
+                        self._username,
+                    )
                     self._authenticated = False
                     await self.async_authenticate()
                     return await self._api_get(endpoint, retry_auth=False)
@@ -208,6 +307,38 @@ class LibrusApiClient:
                 f"Communication error calling {endpoint}: {err}"
             ) from err
 
+    async def _synergia_html_get(self, url: str, retry_auth: bool = True) -> str:
+        """Perform an authenticated GET request to a Synergia HTML page (like `Mati365/librus-api` `_request`)."""
+        if not self._authenticated:
+            await self.async_authenticate()
+
+        session = await self._get_session()
+        full_url = f"{LIBRUS_SYNERGIA_URL}/{url.lstrip('/')}" if not url.startswith("http") else url
+
+        try:
+            async with session.get(full_url, allow_redirects=True) as resp:
+                text = await resp.text()
+                # Check if redirected back to login screen
+                if (
+                    resp.status in (401, 403)
+                    or "loguj" in str(resp.url).lower()
+                    or "Brak dostępu" in text
+                ) and retry_auth:
+                    self._authenticated = False
+                    await self.async_authenticate()
+                    return await self._synergia_html_get(url, retry_auth=False)
+
+                if resp.status >= 400:
+                    raise LibrusApiError(f"HTTP {resp.status} fetching {full_url}")
+
+                return text
+        except LibrusApiError:
+            raise
+        except _NETWORK_EXCEPTIONS as err:
+            raise LibrusConnectionError(
+                f"Communication error fetching {full_url}: {err}"
+            ) from err
+
     @staticmethod
     async def _safe_json(resp: Any) -> dict[str, Any] | None:
         """Attempt to decode JSON response safely."""
@@ -217,47 +348,102 @@ class LibrusApiClient:
             return None
 
     async def async_get_student_profile(self) -> StudentProfile:
-        """Fetch student profile, class info, and today's lucky number."""
-        me_data = await self._api_get("Me")
-        me_obj = me_data.get("Me", {})
-        account = me_obj.get("Account", {})
-        user = me_obj.get("User", {})
+        """Fetch student profile, class info, and today's lucky number.
 
-        first_name = user.get("FirstName") or account.get("FirstName") or ""
-        last_name = user.get("LastName") or account.get("LastName") or ""
-        student_name = f"{first_name} {last_name}".strip() or self._username
-        account_id = str(account.get("Id") or user.get("Id") or self._username)
+        Tries the JSON Gateway (`Me`, `Classes`, `LuckyNumbers`) first, and falls back
+        to scraping `/informacje` (matching `Mati365/librus-api` `info.getAccountInfo()`).
+        """
+        try:
+            me_data = await self._api_get("Me")
+            me_obj = me_data.get("Me", {})
+            account = me_obj.get("Account", {})
+            user = me_obj.get("User", {})
 
+            first_name = user.get("FirstName") or account.get("FirstName") or ""
+            last_name = user.get("LastName") or account.get("LastName") or ""
+            student_name = f"{first_name} {last_name}".strip()
+            if student_name:
+                account_id = str(account.get("Id") or user.get("Id") or self._username)
+                class_name = ""
+                try:
+                    class_data = await self._api_get("Classes")
+                    cls_obj = class_data.get("Class", {})
+                    number = cls_obj.get("Number")
+                    symbol = cls_obj.get("Symbol", "")
+                    if number or symbol:
+                        class_name = f"{number or ''}{symbol}".strip()
+                except LibrusApiError:
+                    pass
+
+                lucky_number: int | None = None
+                lucky_date: str | None = None
+                try:
+                    lucky_data = await self._api_get("LuckyNumbers")
+                    lucky_obj = lucky_data.get("LuckyNumber", {})
+                    if lucky_obj.get("LuckyNumber") is not None:
+                        lucky_number = int(lucky_obj["LuckyNumber"])
+                    lucky_date = lucky_obj.get("LuckyNumberDay")
+                except (LibrusApiError, ValueError, TypeError):
+                    pass
+
+                return StudentProfile(
+                    account_id=account_id,
+                    student_name=student_name,
+                    class_name=class_name,
+                    lucky_number=lucky_number,
+                    lucky_number_date=lucky_date,
+                )
+        except LibrusAuthError:
+            raise
+        except LibrusApiError:
+            _LOGGER.debug("Falling back to HTML /informacje for %s", self._username)
+
+        # Fallback: scrape `/informacje` exactly like `Mati365/librus-api` `info.getAccountInfo()`
+        info_html = await self._synergia_html_get(LIBRUS_SYNERGIA_INFO_URL)
+        return self.parse_account_info_html(info_html, default_username=self._username)
+
+    @staticmethod
+    def parse_account_info_html(
+        info_html: str,
+        default_username: str = "",
+    ) -> StudentProfile:
+        """Parse `/informacje` HTML page (as in `Mati365/librus-api` `info.getAccountInfo()`)."""
+        root = _parse_html_tree(info_html)
+        student_name = ""
         class_name = ""
         student_number: int | None = None
-        try:
-            class_data = await self._api_get("Classes")
-            cls_obj = class_data.get("Class", {})
-            number = cls_obj.get("Number")
-            symbol = cls_obj.get("Symbol", "")
-            if number or symbol:
-                class_name = f"{number or ''}{symbol}".strip()
-        except LibrusApiError:
-            _LOGGER.debug("Could not fetch Classes info for %s", self._username)
-
         lucky_number: int | None = None
-        lucky_date: str | None = None
-        try:
-            lucky_data = await self._api_get("LuckyNumbers")
-            lucky_obj = lucky_data.get("LuckyNumber", {})
-            if lucky_obj.get("LuckyNumber") is not None:
-                lucky_number = int(lucky_obj["LuckyNumber"])
-            lucky_date = lucky_obj.get("LuckyNumberDay")
-        except (LibrusApiError, ValueError, TypeError):
-            _LOGGER.debug("Could not fetch LuckyNumbers for %s", self._username)
+
+        # Look for lucky number span: <span class="luckyNumber"><b>14</b></span>
+        for node in _find_all_nodes(root, {"span", "b", "div"}, recursive=True):
+            cls_attr = node.attrs.get("class", "")
+            if "luckynumber" in cls_attr.lower():
+                txt = node.get_text(" ", strip=True)
+                num_match = re.search(r"\b(\d{1,2})\b", txt)
+                if num_match:
+                    lucky_number = int(num_match.group(1))
+                    break
+
+        # Parse table rows in `/informacje` (`Imię i nazwisko ucznia`, `Klasa`, `Nr w dzienniku`)
+        for tr in _find_all_nodes(root, {"tr"}, recursive=True):
+            th_nodes = _find_all_nodes(tr, {"th", "td"}, recursive=False)
+            if len(th_nodes) < 2:
+                continue
+            label = th_nodes[0].get_text(" ", strip=True).lower()
+            val = th_nodes[1].get_text(" ", strip=True)
+            if "imię i nazwisko" in label and val:
+                student_name = val
+            elif label.startswith("klasa") and val:
+                class_name = val
+            elif ("nr w dzienniku" in label or "numer w dzienniku" in label) and val.isdigit():
+                student_number = int(val)
 
         return StudentProfile(
-            account_id=account_id,
-            student_name=student_name,
+            account_id=default_username or student_name or "student",
+            student_name=student_name or default_username,
             class_name=class_name,
             student_number=student_number,
             lucky_number=lucky_number,
-            lucky_number_date=lucky_date,
         )
 
     async def _ensure_dictionaries(self) -> None:
@@ -316,132 +502,277 @@ class LibrusApiClient:
                 _LOGGER.debug("Unable to load Notes/Categories dictionary")
 
     async def async_get_grades(self) -> list[LibrusGrade]:
-        """Fetch and enrich student's grades sorted from newest to oldest."""
-        await self._ensure_dictionaries()
-        grades_data = await self._api_get("Grades")
+        """Fetch and enrich student's grades sorted from newest to oldest.
 
-        comments_map: dict[int, str] = {}
+        Supports both the JSON Gateway (`Grades`) and HTML scraping of `/przegladaj_oceny/uczen`
+        (matching `Mati365/librus-api` `info.getGrades()`).
+        """
         try:
-            comments_data = await self._api_get("Grades/Comments")
-            for c_item in comments_data.get("Comments", []):
-                if "Id" in c_item and "Text" in c_item:
-                    comments_map[int(c_item["Id"])] = str(c_item["Text"]).strip()
-        except LibrusApiError:
-            _LOGGER.debug("Unable to load Grades/Comments")
+            await self._ensure_dictionaries()
+            grades_data = await self._api_get("Grades")
+            if "Grades" in grades_data:
+                comments_map: dict[int, str] = {}
+                try:
+                    comments_data = await self._api_get("Grades/Comments")
+                    for c_item in comments_data.get("Comments", []):
+                        if "Id" in c_item and "Text" in c_item:
+                            comments_map[int(c_item["Id"])] = str(c_item["Text"]).strip()
+                except LibrusApiError:
+                    pass
 
-        parsed_grades: list[LibrusGrade] = []
-        for raw in grades_data.get("Grades", []):
-            grade_id = str(raw.get("Id", ""))
-            if not grade_id:
-                continue
+                parsed_grades: list[LibrusGrade] = []
+                for raw in grades_data.get("Grades", []):
+                    grade_id = str(raw.get("Id", ""))
+                    if not grade_id:
+                        continue
 
-            subj_id = (raw.get("Subject") or {}).get("Id")
-            subject_name = self._subjects_cache.get(
-                int(subj_id) if subj_id is not None else -1,
-                "Inny przedmiot",
-            )
+                    subj_id = (raw.get("Subject") or {}).get("Id")
+                    subject_name = self._subjects_cache.get(
+                        int(subj_id) if subj_id is not None else -1,
+                        "Inny przedmiot",
+                    )
 
-            cat_id = (raw.get("Category") or {}).get("Id")
-            cat_name, cat_weight = self._grade_categories_cache.get(
-                int(cat_id) if cat_id is not None else -1,
-                ("", None),
-            )
+                    cat_id = (raw.get("Category") or {}).get("Id")
+                    cat_name, cat_weight = self._grade_categories_cache.get(
+                        int(cat_id) if cat_id is not None else -1,
+                        ("", None),
+                    )
 
-            teacher_id = (raw.get("AddedBy") or {}).get("Id")
-            teacher_name = self._users_cache.get(
-                int(teacher_id) if teacher_id is not None else -1,
-                "",
-            )
+                    teacher_id = (raw.get("AddedBy") or {}).get("Id")
+                    teacher_name = self._users_cache.get(
+                        int(teacher_id) if teacher_id is not None else -1,
+                        "",
+                    )
 
-            comment_ids = raw.get("Comments") or []
-            comment_texts = [
-                comments_map[int(cid["Id"])]
-                for cid in comment_ids
-                if isinstance(cid, dict)
-                and "Id" in cid
-                and int(cid["Id"]) in comments_map
-            ]
+                    comment_ids = raw.get("Comments") or []
+                    comment_texts = [
+                        comments_map[int(cid["Id"])]
+                        for cid in comment_ids
+                        if isinstance(cid, dict)
+                        and "Id" in cid
+                        and int(cid["Id"]) in comments_map
+                    ]
 
-            parsed_grades.append(
-                LibrusGrade(
-                    grade_id=grade_id,
-                    subject=subject_name,
-                    value=str(raw.get("Grade", "")).strip(),
-                    date=str(raw.get("Date", "")),
-                    added_at=str(raw.get("AddDate", raw.get("Date", ""))),
-                    weight=raw.get("Weight", cat_weight),
-                    category=cat_name,
-                    teacher=teacher_name,
-                    comment="; ".join(comment_texts),
-                    semester=raw.get("Semester"),
-                    is_final=bool(
-                        raw.get("IsFinal") or raw.get("IsFinalProposition")
+                    parsed_grades.append(
+                        LibrusGrade(
+                            grade_id=grade_id,
+                            subject=subject_name,
+                            value=str(raw.get("Grade", "")).strip(),
+                            date=str(raw.get("Date", "")),
+                            added_at=str(raw.get("AddDate", raw.get("Date", ""))),
+                            weight=raw.get("Weight", cat_weight),
+                            category=cat_name,
+                            teacher=teacher_name,
+                            comment="; ".join(comment_texts),
+                            semester=raw.get("Semester"),
+                            is_final=bool(
+                                raw.get("IsFinal") or raw.get("IsFinalProposition")
+                            ),
+                        )
+                    )
+
+                parsed_grades.sort(
+                    key=lambda g: (
+                        g.added_at or g.date,
+                        int(g.grade_id) if g.grade_id.isdigit() else 0,
                     ),
+                    reverse=True,
                 )
-            )
+                return parsed_grades[: self._max_items]
+        except LibrusApiError:
+            _LOGGER.debug("Falling back to HTML /przegladaj_oceny/uczen for grades")
 
-        # Sort newest first by AddDate/Date and numeric ID
-        parsed_grades.sort(
-            key=lambda g: (g.added_at or g.date, int(g.grade_id) if g.grade_id.isdigit() else 0),
-            reverse=True,
-        )
-        return parsed_grades[: self._max_items]
+        grades_html = await self._synergia_html_get(LIBRUS_SYNERGIA_GRADES_URL)
+        return self.parse_grades_html(grades_html, limit=self._max_items)
 
-    async def async_get_notes(self) -> list[LibrusNote]:
-        """Fetch and enrich student's behavior notes (Uwagi / Pochwały)."""
-        await self._ensure_dictionaries()
-        try:
-            notes_data = await self._api_get("Notes")
-        except LibrusApiError as err:
-            _LOGGER.debug("Notes endpoint unavailable: %s", err)
+    @staticmethod
+    def parse_grades_html(
+        grades_html: str,
+        limit: int = DEFAULT_MAX_ITEMS,
+    ) -> list[LibrusGrade]:
+        """Parse `/przegladaj_oceny/uczen` HTML (matching `Mati365/librus-api` `info.getGrades()`)."""
+        if not grades_html:
             return []
 
-        parsed_notes: list[LibrusNote] = []
-        for raw in notes_data.get("Notes", []):
-            note_id = str(raw.get("Id", ""))
-            if not note_id:
+        root = _parse_html_tree(grades_html)
+        grades: list[LibrusGrade] = []
+
+        for tr in _find_all_nodes(root, {"tr"}, recursive=True):
+            cells = _find_all_nodes(tr, {"td"}, recursive=False)
+            if len(cells) < 3:
                 continue
 
-            cat_id = (raw.get("Category") or {}).get("Id")
-            cat_name, is_positive = self._note_categories_cache.get(
-                int(cat_id) if cat_id is not None else -1,
-                ("Uwaga", None),
-            )
-            if raw.get("Positive") is not None:
-                is_positive = bool(raw.get("Positive"))
+            subject = cells[1].get_text(" ", strip=True) if len(cells) > 1 else ""
+            if not subject or subject.lower() in {"przedmiot", "zachowanie"}:
+                continue
 
-            teacher_id = (raw.get("Teacher") or raw.get("AddedBy") or {}).get("Id")
-            teacher_name = self._users_cache.get(
-                int(teacher_id) if teacher_id is not None else -1,
-                "",
-            )
+            # Find all grade links <a class="ocena" title="Kategoria: ...&#10;Data: ...">
+            for a_node in _find_all_nodes(tr, {"a"}, recursive=True):
+                cls_attr = a_node.attrs.get("class", "").lower()
+                if "ocena" not in cls_attr:
+                    continue
 
-            raw_text = str(raw.get("Text", "")).strip()
-            clean_content = html_to_plain_text(raw_text)
+                grade_val = a_node.get_text(" ", strip=True)
+                if not grade_val:
+                    continue
 
-            parsed_notes.append(
-                LibrusNote(
-                    note_id=note_id,
-                    teacher=teacher_name,
-                    category=cat_name,
-                    content=clean_content,
-                    date=str(raw.get("Date", raw.get("AddDate", ""))),
-                    positive=is_positive,
+                title_attr = a_node.attrs.get("title", "")
+                meta: dict[str, str] = {}
+                for match in _KV_TITLE_RE.finditer(title_attr):
+                    k = match.group(1).strip().lower()
+                    v = match.group(2).strip()
+                    meta[k] = v
+
+                category = meta.get("kategoria", "")
+                date_str = meta.get("data", "")
+                teacher = meta.get("nauczyciel", "") or meta.get("dodał", "")
+                weight_str = meta.get("waga", "")
+                comment = meta.get("komentarz", "")
+                weight: int | float | None = (
+                    int(weight_str) if weight_str.isdigit() else None
                 )
-            )
 
-        parsed_notes.sort(
-            key=lambda n: (n.date, int(n.note_id) if n.note_id.isdigit() else 0),
-            reverse=True,
-        )
-        return parsed_notes[: self._max_items]
+                raw_id_seed = f"{subject}|{grade_val}|{date_str}|{category}|{teacher}|{comment}"
+                grade_id = hashlib.sha1(raw_id_seed.encode("utf-8")).hexdigest()[:12]
+
+                grades.append(
+                    LibrusGrade(
+                        grade_id=grade_id,
+                        subject=subject,
+                        value=grade_val,
+                        date=date_str,
+                        added_at=date_str,
+                        weight=weight,
+                        category=category,
+                        teacher=teacher,
+                        comment=comment,
+                    )
+                )
+
+        grades.sort(key=lambda g: g.date, reverse=True)
+        return grades[:limit]
+
+    async def async_get_notes(self) -> list[LibrusNote]:
+        """Fetch and enrich student's behavior notes (Uwagi / Pochwały).
+
+        Supports both JSON Gateway (`Notes`) and HTML scraping of `/uwagi`
+        (matching `Mati365/librus-api` `info.getNotifications()` / notes).
+        """
+        try:
+            await self._ensure_dictionaries()
+            notes_data = await self._api_get("Notes")
+            if "Notes" in notes_data:
+                parsed_notes: list[LibrusNote] = []
+                for raw in notes_data.get("Notes", []):
+                    note_id = str(raw.get("Id", ""))
+                    if not note_id:
+                        continue
+
+                    cat_id = (raw.get("Category") or {}).get("Id")
+                    cat_name, is_positive = self._note_categories_cache.get(
+                        int(cat_id) if cat_id is not None else -1,
+                        ("Uwaga", None),
+                    )
+                    if raw.get("Positive") is not None:
+                        is_positive = bool(raw.get("Positive"))
+
+                    teacher_id = (raw.get("Teacher") or raw.get("AddedBy") or {}).get("Id")
+                    teacher_name = self._users_cache.get(
+                        int(teacher_id) if teacher_id is not None else -1,
+                        "",
+                    )
+
+                    raw_text = str(raw.get("Text", "")).strip()
+                    clean_content = html_to_plain_text(raw_text)
+
+                    parsed_notes.append(
+                        LibrusNote(
+                            note_id=note_id,
+                            teacher=teacher_name,
+                            category=cat_name,
+                            content=clean_content,
+                            date=str(raw.get("Date", raw.get("AddDate", ""))),
+                            positive=is_positive,
+                        )
+                    )
+
+                parsed_notes.sort(
+                    key=lambda n: (n.date, int(n.note_id) if n.note_id.isdigit() else 0),
+                    reverse=True,
+                )
+                return parsed_notes[: self._max_items]
+        except LibrusApiError:
+            _LOGGER.debug("Falling back to HTML /uwagi for notes")
+
+        try:
+            notes_html = await self._synergia_html_get(LIBRUS_SYNERGIA_NOTES_URL)
+            return self.parse_notes_html(notes_html, limit=self._max_items)
+        except LibrusApiError:
+            return []
+
+    @staticmethod
+    def parse_notes_html(
+        notes_html: str,
+        limit: int = DEFAULT_MAX_ITEMS,
+    ) -> list[LibrusNote]:
+        """Parse `/uwagi` HTML table into `LibrusNote` objects."""
+        if not notes_html:
+            return []
+
+        root = _parse_html_tree(notes_html)
+        notes: list[LibrusNote] = []
+
+        for table in _find_all_nodes(root, {"table"}, recursive=True):
+            rows = _find_all_nodes(table, {"tr"}, recursive=True)
+            note_content = ""
+            note_date = ""
+            note_teacher = ""
+            note_category = "Uwaga"
+
+            for tr in rows:
+                cells = _find_all_nodes(tr, {"th", "td"}, recursive=False)
+                if len(cells) < 2:
+                    continue
+                label = cells[0].get_text(" ", strip=True).lower()
+                val = cells[1].get_text(" ", strip=True)
+                if "treść" in label:
+                    note_content = val
+                elif "data" in label:
+                    note_date = val
+                elif "nauczyciel" in label or "dodał" in label:
+                    note_teacher = val
+                elif "kategoria" in label or "rodzaj" in label:
+                    note_category = val
+
+            if note_content:
+                seed = f"{note_date}|{note_teacher}|{note_content}"
+                note_id = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+                is_pos: bool | None = None
+                if "pozytywn" in note_category.lower() or "pochwał" in note_category.lower():
+                    is_pos = True
+                elif "negatywn" in note_category.lower() or "uwag" in note_category.lower():
+                    is_pos = False
+
+                notes.append(
+                    LibrusNote(
+                        note_id=note_id,
+                        teacher=note_teacher,
+                        category=note_category,
+                        content=note_content,
+                        date=note_date,
+                        positive=is_pos,
+                    )
+                )
+
+        notes.sort(key=lambda n: n.date, reverse=True)
+        return notes[:limit]
 
     async def async_get_messages(self) -> list[LibrusMessage]:
         """Fetch incoming messages from Librus and format them into readable Markdown & text."""
         if not self._authenticated:
             await self.async_authenticate()
 
-        # First attempt JSON Messages endpoint if available, then fall back to HTML Wiadomości
+        # First attempt JSON Messages endpoint if available, then use HTML Wiadomości (`inbox.listInbox`)
         messages = await self._try_fetch_json_messages()
         if messages is None:
             messages = await self._fetch_html_messages()
@@ -510,14 +841,10 @@ class LibrusApiClient:
         return results
 
     async def _fetch_html_messages(self) -> list[LibrusMessage]:
-        """Scrape and sanitize incoming messages from Librus Synergia Wiadomości HTML view."""
-        session = await self._get_session()
+        """Scrape and sanitize incoming messages from `/wiadomosci` (matching `Mati365/librus-api` `inbox`)."""
         try:
-            async with session.get(LIBRUS_SYNERGIA_MESSAGES_URL) as resp:
-                if resp.status != 200:
-                    return []
-                inbox_html = await resp.text()
-        except _NETWORK_EXCEPTIONS:
+            inbox_html = await self._synergia_html_get(LIBRUS_SYNERGIA_MESSAGES_URL)
+        except LibrusApiError:
             return []
 
         inbox_entries = self.parse_inbox_html(inbox_html, limit=self._max_items)
@@ -526,16 +853,9 @@ class LibrusApiClient:
         for entry in inbox_entries:
             detail_html = ""
             if entry["url"]:
-                full_url = (
-                    f"https://synergia.librus.pl{entry['url']}"
-                    if entry["url"].startswith("/")
-                    else entry["url"]
-                )
                 try:
-                    async with session.get(full_url) as detail_resp:
-                        if detail_resp.status == 200:
-                            detail_html = await detail_resp.text()
-                except _NETWORK_EXCEPTIONS:
+                    detail_html = await self._synergia_html_get(entry["url"], retry_auth=False)
+                except LibrusApiError:
                     _LOGGER.debug("Failed to load message detail %s", entry["message_id"])
 
             body_html, attachments = self.parse_message_detail_html(detail_html)
@@ -579,7 +899,6 @@ class LibrusApiClient:
         if not tables:
             return []
 
-        # Prefer table with class 'decorated' or 'wiadomosci'
         target_table = tables[0]
         for tbl in tables:
             cls_attr = tbl.attrs.get("class", "").lower()

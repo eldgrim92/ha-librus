@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ha-librus"
-version = "0.1.0"
+version = "0.1.1"
 description = "Home Assistant Custom Integration for Librus Synergia (multi-child support, readable messages, grades, notes, and push notifications)"
 readme = "README.md"
 requires-python = ">=3.11"

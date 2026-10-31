@@ -8,7 +8,12 @@ from tests.conftest import install_ha_stubs
 
 install_ha_stubs()
 
-from custom_components.librus.api.client import LibrusApiClient  # noqa: E402
+from custom_components.librus.api.client import LibrusApiClient, LibrusAuthError  # noqa: E402
+from custom_components.librus.const import (  # noqa: E402
+    LIBRUS_OAUTH_AUTH_URL,
+    LIBRUS_OAUTH_GRANT_URL,
+    LIBRUS_OAUTH_LOGIN_URL,
+)
 from custom_components.librus.api.parser import (  # noqa: E402
     format_message_markdown,
     format_sender_name,
@@ -123,6 +128,118 @@ class TestMessageParser(unittest.TestCase):
         body_html, attachments = LibrusApiClient.parse_message_detail_html(detail_html)
         self.assertIn("Zapraszam na zebranie", body_html)
         self.assertEqual(attachments, ["harmonogram.pdf"])
+
+    def test_parse_account_info_grades_and_notes_html_fallbacks(self) -> None:
+        info_html = """
+        <span class="luckyNumber"><b>17</b></span>
+        <table>
+            <tr><th>Imię i nazwisko ucznia</th><td>Jan Kowalski</td></tr>
+            <tr><th>Klasa</th><td>5b</td></tr>
+            <tr><th>Nr w dzienniku</th><td>17</td></tr>
+        </table>
+        """
+        profile = LibrusApiClient.parse_account_info_html(info_html, default_username="123u")
+        self.assertEqual(profile.student_name, "Jan Kowalski")
+        self.assertEqual(profile.class_name, "5b")
+        self.assertEqual(profile.student_number, 17)
+        self.assertEqual(profile.lucky_number, 17)
+        self.assertTrue(profile.is_lucky_today)
+
+        grades_html = """
+        <table>
+            <tr>
+                <td>1</td>
+                <td>Matematyka</td>
+                <td>
+                    <a class="ocena" title="Kategoria: Sprawdzian\nData: 2026-10-30\nNauczyciel: Piotr Wiśniewski\nWaga: 3\nKomentarz: Ułamki">5-</a>
+                </td>
+            </tr>
+        </table>
+        """
+        grades = LibrusApiClient.parse_grades_html(grades_html)
+        self.assertEqual(len(grades), 1)
+        self.assertEqual(grades[0].subject, "Matematyka")
+        self.assertEqual(grades[0].value, "5-")
+        self.assertEqual(grades[0].weight, 3)
+        self.assertEqual(grades[0].category, "Sprawdzian")
+        self.assertEqual(grades[0].teacher, "Piotr Wiśniewski")
+        self.assertEqual(grades[0].comment, "Ułamki")
+
+        notes_html = """
+        <table>
+            <tr><th>Data</th><td>2026-10-28</td></tr>
+            <tr><th>Nauczyciel</th><td>Anna Nowak</td></tr>
+            <tr><th>Kategoria</th><td>Pochwała</td></tr>
+            <tr><th>Treść</th><td>Wzorowa pomoc przy akademii.</td></tr>
+        </table>
+        """
+        notes = LibrusApiClient.parse_notes_html(notes_html)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].teacher, "Anna Nowak")
+        self.assertTrue(notes[0].positive)
+        self.assertEqual(notes[0].content, "Wzorowa pomoc przy akademii.")
+
+
+class _FakeResponse:
+    def __init__(self, status: int = 200, json_data: dict | None = None, text_data: str = "", url: str = "") -> None:
+        self.status = status
+        self._json = json_data
+        self._text = text_data
+        self.url = url
+
+    async def json(self, content_type: str | None = None) -> dict | None:
+        return self._json
+
+    async def text(self) -> str:
+        return self._text
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        return None
+
+
+class _FakeSession:
+    def __init__(self, post_json: dict | None = None) -> None:
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self._post_json = post_json if post_json is not None else {"status": "ok", "goTo": "/OAuth/Authorization/Grant?client_id=46"}
+
+    def get(self, url: str, **kwargs) -> _FakeResponse:
+        self.calls.append(("GET", url, None))
+        return _FakeResponse(status=200, json_data={})
+
+    def post(self, url: str, data: dict | None = None, **kwargs) -> _FakeResponse:
+        self.calls.append(("POST", url, data))
+        return _FakeResponse(status=200, json_data=self._post_json)
+
+
+class TestMati365AuthorizeFlow(unittest.IsolatedAsyncioTestCase):
+    """Verify `async_authenticate` executes the `Mati365/librus-api` OAuth Grant sequence."""
+
+    async def test_authorize_calls_oauth_login_and_grant(self) -> None:
+        session = _FakeSession()
+        client = LibrusApiClient(username="123456u", password="secret", session=session)
+        await client.async_authenticate()
+
+        self.assertEqual(session.calls[0][0], "GET")
+        self.assertEqual(session.calls[0][1], LIBRUS_OAUTH_AUTH_URL)
+
+        self.assertEqual(session.calls[1][0], "POST")
+        self.assertEqual(session.calls[1][1], LIBRUS_OAUTH_LOGIN_URL)
+        self.assertEqual(
+            session.calls[1][2],
+            {"action": "login", "login": "123456u", "pass": "secret"},
+        )
+
+        self.assertEqual(session.calls[2][0], "GET")
+        self.assertEqual(session.calls[2][1], LIBRUS_OAUTH_GRANT_URL)
+
+    async def test_authorize_raises_on_error_status(self) -> None:
+        session = _FakeSession(post_json={"status": "error", "errors": [{"message": "Nieprawidłowy login"}]})
+        client = LibrusApiClient(username="123456u", password="wrong", session=session)
+        with self.assertRaises(LibrusAuthError):
+            await client.async_authenticate()
 
 
 if __name__ == "__main__":

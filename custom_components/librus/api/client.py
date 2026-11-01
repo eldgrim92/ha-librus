@@ -19,6 +19,7 @@ from datetime import datetime
 import hashlib
 import logging
 import re
+import time
 from typing import Any
 
 try:
@@ -35,6 +36,7 @@ from ..const import (
     LIBRUS_OAUTH_AUTH_URL,
     LIBRUS_OAUTH_GRANT_URL,
     LIBRUS_OAUTH_LOGIN_URL,
+    LIBRUS_PORTAL_RODZINA_LOGIN_URL,
     LIBRUS_SYNERGIA_GRADES_URL,
     LIBRUS_SYNERGIA_INFO_URL,
     LIBRUS_SYNERGIA_MESSAGES_URL,
@@ -170,15 +172,31 @@ class LibrusApiClient:
             self._cookie_jar.clear()
 
         try:
-            # Step 1: Initialize OAuth authorization cookie (exact URL from Mati365/librus-api)
+            # Step 1A: Bootstrap session on synergia.librus.pl/loguj/portalRodzina?v=<timestamp>
+            portal_url = f"{LIBRUS_PORTAL_RODZINA_LOGIN_URL}?v={int(time.time())}"
             async with session.get(
-                LIBRUS_OAUTH_AUTH_URL,
+                portal_url,
                 allow_redirects=True,
-            ) as resp:
-                if resp.status >= 500:
-                    raise LibrusConnectionError(
-                        f"Librus OAuth server error during initialization: HTTP {resp.status}"
-                    )
+            ) as portal_resp:
+                final_init_url = str(getattr(portal_resp, "url", ""))
+
+            # Step 1B: Ensure OAuth authorization cookie is initialized if portal_url didn't redirect there
+                if "api.librus.pl/OAuth/Authorization" not in final_init_url:
+                    async with session.get(
+                        LIBRUS_OAUTH_AUTH_URL,
+                        allow_redirects=True,
+                    ) as resp:
+                        if resp.status >= 500:
+                            err_body = await self._safe_response_text(resp)
+                            _LOGGER.error(
+                                "Librus OAuth init HTTP %s from %s. Response body: %s",
+                                resp.status,
+                                LIBRUS_OAUTH_AUTH_URL,
+                                err_body,
+                            )
+                            raise LibrusConnectionError(
+                                f"Librus OAuth server error during initialization: HTTP {resp.status} ({err_body[:300]})"
+                            )
 
             # Step 2: Submit credentials via form-urlencoded POST
             form_payload = {
@@ -195,16 +213,39 @@ class LibrusApiClient:
                 data=form_payload,
                 headers=login_headers,
             ) as resp:
-                if resp.status in (401, 403):
-                    raise LibrusAuthError("Invalid Librus username or password")
+                if resp.status in (401, 403) or resp.status >= 400:
+                    err_body = await self._safe_response_text(resp)
+                    _LOGGER.error(
+                        "Librus OAuth login failed with HTTP %s from %s. Response body: %s",
+                        resp.status,
+                        LIBRUS_OAUTH_LOGIN_URL,
+                        err_body,
+                    )
+                    if resp.status in (401, 403):
+                        raise LibrusAuthError(
+                            f"Invalid Librus username or password (HTTP {resp.status}: {err_body[:300]})"
+                        )
 
                 data = await self._safe_json(resp)
                 if isinstance(data, dict):
                     status = data.get("status")
                     if status == "error" or data.get("errors"):
-                        raise LibrusAuthError("Invalid Librus username or password")
+                        _LOGGER.error(
+                            "Librus OAuth login returned error payload for %s: %s",
+                            self._username,
+                            data,
+                        )
+                        raise LibrusAuthError(
+                            f"Invalid Librus username or password: {data}"
+                        )
                     go_to = data.get("goTo")
                 else:
+                    raw_login_text = await self._safe_response_text(resp)
+                    _LOGGER.warning(
+                        "Librus OAuth login returned non-JSON response (HTTP %s): %s",
+                        resp.status,
+                        raw_login_text[:500],
+                    )
                     go_to = None
 
             # Step 3: Complete Grant / 2FA redirect as in Mati365/librus-api
@@ -226,7 +267,24 @@ class LibrusApiClient:
             for target_url in grant_targets:
                 async with session.get(target_url, allow_redirects=True) as grant_resp:
                     if grant_resp.status in (401, 403):
-                        raise LibrusAuthError("Failed to finalize Librus OAuth Grant")
+                        err_body = await self._safe_response_text(grant_resp)
+                        _LOGGER.error(
+                            "Librus OAuth Grant failed with HTTP %s at %s. Response body: %s",
+                            grant_resp.status,
+                            target_url,
+                            err_body,
+                        )
+                        raise LibrusAuthError(
+                            f"Failed to finalize Librus OAuth Grant (HTTP {grant_resp.status}: {err_body[:300]})"
+                        )
+                    if grant_resp.status >= 400:
+                        err_body = await self._safe_response_text(grant_resp)
+                        _LOGGER.warning(
+                            "Librus OAuth Grant returned HTTP %s at %s. Response body: %s",
+                            grant_resp.status,
+                            target_url,
+                            err_body,
+                        )
                     if grant_resp.status < 400:
                         grant_succeeded = True
                         # If we landed on api.librus.pl/OAuth/Authorization/2FA and it returned JSON with goTo
@@ -238,15 +296,31 @@ class LibrusApiClient:
                                 if next_goto.startswith("/")
                                 else next_goto
                             )
-                            async with session.get(next_url, allow_redirects=True):
-                                pass
+                            async with session.get(next_url, allow_redirects=True) as next_resp:
+                                if next_resp.status >= 400:
+                                    err_body = await self._safe_response_text(next_resp)
+                                    _LOGGER.error(
+                                        "Librus secondary goTo failed with HTTP %s at %s. Response: %s",
+                                        next_resp.status,
+                                        next_url,
+                                        err_body,
+                                    )
                         break
 
             if not grant_succeeded:
                 # Fallback to 2FA endpoint if Grant endpoint wasn't reachable directly
                 async with session.get(LIBRUS_OAUTH_2FA_URL, allow_redirects=True) as resp_2fa:
                     if resp_2fa.status >= 400:
-                        raise LibrusAuthError("Failed to establish Librus Synergia session")
+                        err_body = await self._safe_response_text(resp_2fa)
+                        _LOGGER.error(
+                            "Librus 2FA fallback failed with HTTP %s at %s. Response body: %s",
+                            resp_2fa.status,
+                            LIBRUS_OAUTH_2FA_URL,
+                            err_body,
+                        )
+                        raise LibrusAuthError(
+                            f"Failed to establish Librus Synergia session (HTTP {resp_2fa.status}: {err_body[:300]})"
+                        )
 
             # Step 4: Activate API Gateway token if supported (Auth/TokenInfo -> Auth/UserInfo)
             await self._async_activate_api_gateway(session)
@@ -293,10 +367,28 @@ class LibrusApiClient:
                     return await self._api_get(endpoint, retry_auth=False)
 
                 if resp.status in (401, 403):
-                    raise LibrusAuthError(f"Unauthorized access to {endpoint}")
+                    err_body = await self._safe_response_text(resp)
+                    _LOGGER.error(
+                        "Librus API unauthorized (HTTP %s) at %s. Response body: %s",
+                        resp.status,
+                        url,
+                        err_body,
+                    )
+                    raise LibrusAuthError(
+                        f"Unauthorized access to {endpoint} (HTTP {resp.status}: {err_body[:300]})"
+                    )
 
                 if resp.status >= 400:
-                    raise LibrusApiError(f"HTTP {resp.status} from {endpoint}")
+                    err_body = await self._safe_response_text(resp)
+                    _LOGGER.error(
+                        "Librus API HTTP %s at %s. Response body: %s",
+                        resp.status,
+                        url,
+                        err_body,
+                    )
+                    raise LibrusApiError(
+                        f"HTTP {resp.status} from {endpoint}: {err_body[:300]}"
+                    )
 
                 data = await self._safe_json(resp)
                 return data if isinstance(data, dict) else {}
@@ -329,7 +421,16 @@ class LibrusApiClient:
                     return await self._synergia_html_get(url, retry_auth=False)
 
                 if resp.status >= 400:
-                    raise LibrusApiError(f"HTTP {resp.status} fetching {full_url}")
+                    _LOGGER.error(
+                        "Librus Synergia HTML GET failed with HTTP %s at %s (final URL: %s). Response body: %s",
+                        resp.status,
+                        full_url,
+                        getattr(resp, "url", full_url),
+                        text[:500],
+                    )
+                    raise LibrusApiError(
+                        f"HTTP {resp.status} fetching {full_url}: {text[:300]}"
+                    )
 
                 return text
         except LibrusApiError:
@@ -338,6 +439,15 @@ class LibrusApiClient:
             raise LibrusConnectionError(
                 f"Communication error fetching {full_url}: {err}"
             ) from err
+
+    @staticmethod
+    async def _safe_response_text(resp: Any) -> str:
+        """Attempt to read response text safely for error diagnostics."""
+        try:
+            text = await resp.text()
+            return " ".join(str(text).split())
+        except Exception:  # noqa: BLE001
+            return "<unreadable response body>"
 
     @staticmethod
     async def _safe_json(resp: Any) -> dict[str, Any] | None:

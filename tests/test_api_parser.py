@@ -223,17 +223,22 @@ class TestMati365AuthorizeFlow(unittest.IsolatedAsyncioTestCase):
         await client.async_authenticate()
 
         self.assertEqual(session.calls[0][0], "GET")
-        self.assertEqual(session.calls[0][1], LIBRUS_OAUTH_AUTH_URL)
+        self.assertTrue(
+            session.calls[0][1].startswith("https://synergia.librus.pl/loguj/portalRodzina?v=")
+        )
 
-        self.assertEqual(session.calls[1][0], "POST")
-        self.assertEqual(session.calls[1][1], LIBRUS_OAUTH_LOGIN_URL)
+        self.assertEqual(session.calls[1][0], "GET")
+        self.assertEqual(session.calls[1][1], LIBRUS_OAUTH_AUTH_URL)
+
+        self.assertEqual(session.calls[2][0], "POST")
+        self.assertEqual(session.calls[2][1], LIBRUS_OAUTH_LOGIN_URL)
         self.assertEqual(
-            session.calls[1][2],
+            session.calls[2][2],
             {"action": "login", "login": "123456u", "pass": "secret"},
         )
 
-        self.assertEqual(session.calls[2][0], "GET")
-        self.assertEqual(session.calls[2][1], LIBRUS_OAUTH_GRANT_URL)
+        self.assertEqual(session.calls[3][0], "GET")
+        self.assertEqual(session.calls[3][1], LIBRUS_OAUTH_GRANT_URL)
 
     async def test_authorize_raises_on_error_status(self) -> None:
         session = _FakeSession(post_json={"status": "error", "errors": [{"message": "Nieprawidłowy login"}]})
